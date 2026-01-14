@@ -1,0 +1,214 @@
+name: AWS Microservices CI/CD (ECR + EKS)
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "services/**"
+      - "infra/**"
+      - ".github/workflows/**"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "services/**"
+      - "infra/**"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment environment"
+        required: true
+        type: choice
+        options: [dev, stage, prod]
+      deploy_strategy:
+        description: "Deployment strategy"
+        required: true
+        type: choice
+        options: [rolling, canary]
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: read
+
+env:
+  AWS_REGION: us-east-1
+  EKS_CLUSTER_NAME: microservices-eks
+  ECR_REGISTRY: 061051245830.dkr.ecr.us-east-1.amazonaws.com
+
+  DEV_NAMESPACE: dev
+  STAGE_NAMESPACE: stage
+  PROD_NAMESPACE: prod
+
+  SERVICES: |
+    auth-service
+    orders-service
+    payments-service
+    inventory-service
+
+jobs:
+  detect-changes:
+    name: Detect changed microservices
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed services
+        id: set-matrix
+        shell: bash
+        run: |
+          echo "Detecting changed services..."
+
+          CHANGED=$(git diff --name-only origin/main...HEAD || true)
+          echo "$CHANGED"
+
+          SERVICES=()
+          while read -r line; do
+            if [[ "$line" =~ ^services/([^/]+)/ ]]; then
+              svc="${BASH_REMATCH[1]}"
+              SERVICES+=("$svc")
+            fi
+          done <<< "$CHANGED"
+
+          if [ ${#SERVICES[@]} -eq 0 ]; then
+            echo "No service changes detected. Building all services."
+            while read -r svc; do
+              SERVICES+=("$svc")
+            done <<< "${{ env.SERVICES }}"
+          fi
+
+          UNIQUE=$(printf "%s\n" "${SERVICES[@]}" | sort -u)
+
+          JSON='{"include":['
+          first=1
+          while read -r svc; do
+            if [ -z "$svc" ]; then
+              continue
+            fi
+            if [ $first -eq 0 ]; then
+              JSON+=','
+            fi
+            first=0
+            JSON+="{\"service\":\"$svc\"}"
+          done <<< "$UNIQUE"
+          JSON+=']}'
+
+          echo "Matrix JSON: $JSON"
+          echo "matrix=$JSON" >> $GITHUB_OUTPUT
+
+  ci:
+    name: CI - Lint/Test (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Lint (Go)
+        working-directory: services/${{ matrix.service }}
+        run: |
+          go fmt ./...
+          go vet ./...
+
+      - name: Unit tests (Go)
+        working-directory: services/${{ matrix.service }}
+        run: |
+          go test ./... -v
+
+  build-and-push:
+    name: Build & Push to ECR (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    needs: [detect-changes, ci]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::061051245830:role/github-oidc-ecr-eks-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create image tag
+        id: meta
+        shell: bash
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          TS="$(date +%Y%m%d%H%M%S)"
+          IMAGE_TAG="${SHORT_SHA}-${TS}"
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        shell: bash
+        run: |
+          SERVICE="${{ matrix.service }}"
+          IMAGE="${{ env.ECR_REGISTRY }}/${SERVICE}:${{ steps.meta.outputs.image_tag }}"
+          docker build -t "$IMAGE" -f "services/${SERVICE}/Dockerfile" "services/${SERVICE}"
+
+      - name: Push Docker image to ECR
+        shell: bash
+        run: |
+          SERVICE="${{ matrix.service }}"
+          IMAGE="${{ env.ECR_REGISTRY }}/${SERVICE}:${{ steps.meta.outputs.image_tag }}"
+          docker push "$IMAGE"
+
+  deploy-dev:
+    name: Deploy to DEV (EKS)
+    runs-on: ubuntu-latest
+    needs: [build-and-push]
+    if: github.ref == 'refs/heads/main'
+    environment: dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::061051245830:role/github-oidc-ecr-eks-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.30.0"
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: "v3.15.0"
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig --region "${{ env.AWS_REGION }}" --name "${{ env.EKS_CLUSTER_NAME }}"
+
+      - name: Deploy all services to DEV
+        shell: bash
+        run: |
+          set -e
+          NAMESPACE="${{ env.DEV_NAMESPACE }}"
+          kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+          while read -r svc; do
+            if [ -z "$svc" ]; then continue; fi
+            IMAGE="${{ env.ECR_REGISTRY }}/${svc}"
+            TAG="${GITHUB_SHA::7}"
+            helm upgrade --install "$svc" "infra/helm/$svc"               --namespace "$NAMESPACE"               --set image.repository="$IMAGE"               --set image.tag="$TAG"               --set env.name="dev"               --wait --timeout 5m
+          done <<< "${{ env.SERVICES }}"
